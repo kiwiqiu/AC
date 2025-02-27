@@ -1,5 +1,5 @@
 简体中文 | [English](./README_en.md)
-
+version 2.0
 # 基于Pytorch实现的声音分类系统
 
 ![python version](https://img.shields.io/badge/python-3.8+-orange.svg)
