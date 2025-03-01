@@ -24,7 +24,7 @@ from macls.optimizer import build_optimizer, build_lr_scheduler
 from macls.utils.checkpoint import load_pretrained, load_checkpoint, save_checkpoint
 from macls.utils.utils import dict_to_object, plot_confusion_matrix, print_arguments
 
-
+# VERSION 1
 class MAClsTrainer(object):
     def __init__(self, configs, use_gpu=True, data_augment_configs=None):
         """ macls集成工具类
