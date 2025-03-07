@@ -79,7 +79,7 @@ class ResNetSE(nn.Module):
         self.layer3 = self._make_layer(SEBottleneck, num_filters[2], layers[2], stride=(2, 2))
         self.layer4 = self._make_layer(SEBottleneck, num_filters[3], layers[3], stride=(2, 2))
 
-        # 自蒸馏分支结构
+        # 自蒸馏分支结构, SEBottleneck的expansion = 2，num_filters=[32, 64, 128, 256]
         self._build_distillation_branches(num_filters, SEBottleneck.expansion, num_class, embd_dim)
 
         # 池化层和分类层
@@ -138,6 +138,7 @@ class ResNetSE(nn.Module):
 
     def _build_distillation_branches(self, num_filters, expansion, num_class, embd_dim):
         # 中间分支1（layer1之后）
+        self.attention1 = SELayer(num_filters[0] * expansion)  # 添加SELayer
         self.bottleneck1_1 = nn.Sequential(
             # 调整空间尺寸到 (10, 13)
             nn.Conv2d(num_filters[0] * expansion, 512, kernel_size=(7, 7), stride=(8, 8), padding=(3, 3)),
@@ -152,6 +153,7 @@ class ResNetSE(nn.Module):
         # self.middle_fc1 = nn.Linear(512, num_class)
 
         # 中间分支2（layer2之后）
+        self.attention2 = SELayer(num_filters[1] * expansion)  # 添加SELayer
         self.bottleneck2_1 = nn.Sequential(
             # 调整空间尺寸到 (10, 13)
             nn.Conv2d(num_filters[1] * expansion, 512, kernel_size=(5, 5), stride=(4, 4), padding=(2, 2)),
@@ -166,6 +168,7 @@ class ResNetSE(nn.Module):
         # self.middle_fc2 = nn.Linear(512, num_class)
 
         # 中间分支3（layer3之后）
+        self.attention3 = SELayer(num_filters[2] * expansion)  # 添加SELayer
         self.bottleneck3_1 = nn.Sequential(
             # 调整空间尺寸到 (10, 13)
             nn.Conv2d(num_filters[2] * expansion, 512, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
@@ -203,7 +206,8 @@ class ResNetSE(nn.Module):
         x = self.relu(x) # (1,32,80,98)
         # 主分支处理
         x1 = self.layer1(x) # (1,64,80,98)
-        middle1_out = self.bottleneck1_1(x1)  # 输出形状: (1, 512, 10, 13)
+        x1_att = self.attention1(x1) # 应用se注意力
+        middle1_out = self.bottleneck1_1(x1_att)  # 输出形状: (1, 512, 10, 13)
         middle1_out = middle1_out.reshape(middle1_out.size(0), -1, middle1_out.size(-1))  # (1, 512 * 10, 13)
         middle1_out = self.sap_pool1(middle1_out) # (1, 5120)
         middle1_out = self.middle1_bn1(middle1_out)
@@ -213,7 +217,8 @@ class ResNetSE(nn.Module):
         middle1_out = self.middle1_fc(middle1_out)
 
         x2 = self.layer2(x1) # (1,128,40,49)
-        middle2_out = self.bottleneck2_1(x2) # (1, 512, 10, 13)
+        x2_att = self.attention2(x2)  # 应用se注意力
+        middle2_out = self.bottleneck2_1(x2_att) # (1, 512, 10, 13)
         middle2_out = middle2_out.reshape(middle2_out.size(0), -1, middle2_out.size(-1))  # (1, 512 * 10, 13)
         middle2_out = self.sap_pool2(middle2_out)# (1, 5120)
         middle2_out = self.middle2_bn1(middle2_out)
@@ -223,7 +228,8 @@ class ResNetSE(nn.Module):
         middle2_out = self.middle2_fc(middle2_out)
 
         x3 = self.layer3(x2) # (1,256,20,25)
-        middle3_out = self.bottleneck3_1(x3) # (1, 512, 10, 13)
+        x3_att = self.attention3(x3)  # 应用se注意力
+        middle3_out = self.bottleneck3_1(x3_att) # (1, 512, 10, 13)
         middle3_out = middle3_out.reshape(middle3_out.size(0), -1, middle3_out.size(-1))  # (1, 512 * 10, 13)
         middle3_out = self.sap_pool3(middle3_out) # (1, 5120)
         middle3_out = self.middle3_bn1(middle3_out)
