@@ -350,9 +350,9 @@ class MAClsTrainer(object):
         :param pretrained_model: 预训练模型的路径，当为None则不使用预训练模型
         """
         # 创建结果保存路径
-        result_dir = os.path.join(log_dir, "results")
+        result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'ResNetSE_eval_results_a0.2.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_train_results_a0.8_b4e-2.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
