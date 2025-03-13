@@ -1,11 +1,9 @@
-import torch
 import torch.nn as nn
 
 from macls.models.pooling import AttentiveStatisticsPooling, TemporalAveragePooling, MQMHASP, GlobalMultiHeadAttentionPooling
 from macls.models.pooling import SelfAttentivePooling, TemporalStatisticsPooling, LDEPooling, MultiHeadAttentionPooling
 
 
-# version2 加自蒸馏
 class SEBottleneck(nn.Module):
     expansion = 2
 
@@ -63,26 +61,22 @@ class SELayer(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
+
 class ResNetSE(nn.Module):
     def __init__(self, num_class, input_size, layers=[3, 4, 6, 3], num_filters=[32, 64, 128, 256], embd_dim=192,
                  pooling_type="SAP"):
         super(ResNetSE, self).__init__()
         self.inplanes = num_filters[0]
         self.emb_size = embd_dim
-        # 初始卷积
         self.conv1 = nn.Conv2d(1, num_filters[0], kernel_size=3, stride=(1, 1), padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(num_filters[0])
         self.relu = nn.ReLU(inplace=True)
-        # 主体网络层
+
         self.layer1 = self._make_layer(SEBottleneck, num_filters[0], layers[0])
         self.layer2 = self._make_layer(SEBottleneck, num_filters[1], layers[1], stride=(2, 2))
         self.layer3 = self._make_layer(SEBottleneck, num_filters[2], layers[2], stride=(2, 2))
         self.layer4 = self._make_layer(SEBottleneck, num_filters[3], layers[3], stride=(2, 2))
 
-        # 自蒸馏分支结构, SEBottleneck的expansion = 2，num_filters=[32, 64, 128, 256]
-        self._build_distillation_branches(num_filters, SEBottleneck.expansion, num_class, embd_dim)
-
-        # 池化层和分类层
         cat_channels = num_filters[3] * SEBottleneck.expansion * (input_size // 8) # cat_channel:5120
         if pooling_type == "ASP":
             self.pooling = AttentiveStatisticsPooling(cat_channels, 128)
@@ -128,59 +122,13 @@ class ResNetSE(nn.Module):
             raise Exception(f'没有{pooling_type}池化层！')
 
         self.fc = nn.Linear(embd_dim, num_class)
-        # 权重初始化
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-
-    def _build_distillation_branches(self, num_filters, expansion, num_class, embd_dim):
-        # 中间分支1（layer1之后）
-        self.attention1 = SELayer(num_filters[0] * expansion)  # 添加SELayer
-        self.bottleneck1_1 = nn.Sequential(
-            # 调整空间尺寸到 (10, 13)
-            nn.Conv2d(num_filters[0] * expansion, 512, kernel_size=(7, 7), stride=(8, 8), padding=(3, 3)),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-        )
-        self.sap_pool1 = SelfAttentivePooling(5120, 128)
-        self.middle1_bn1 = nn.BatchNorm1d(5120)
-        self.middle1_linear = nn.Linear(5120, embd_dim)
-        self.middle1_bn2 = nn.BatchNorm1d(embd_dim)
-        self.middle1_fc = nn.Linear(embd_dim, num_class)
-        # self.middle_fc1 = nn.Linear(512, num_class)
-
-        # 中间分支2（layer2之后）
-        self.attention2 = SELayer(num_filters[1] * expansion)  # 添加SELayer
-        self.bottleneck2_1 = nn.Sequential(
-            # 调整空间尺寸到 (10, 13)
-            nn.Conv2d(num_filters[1] * expansion, 512, kernel_size=(5, 5), stride=(4, 4), padding=(2, 2)),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-        )
-        self.sap_pool2 = SelfAttentivePooling(5120, 128)
-        self.middle2_bn1 = nn.BatchNorm1d(5120)
-        self.middle2_linear = nn.Linear(5120, embd_dim)
-        self.middle2_bn2 = nn.BatchNorm1d(embd_dim)
-        self.middle2_fc = nn.Linear(embd_dim, num_class)
-        # self.middle_fc2 = nn.Linear(512, num_class)
-
-        # 中间分支3（layer3之后）
-        self.attention3 = SELayer(num_filters[2] * expansion)  # 添加SELayer
-        self.bottleneck3_1 = nn.Sequential(
-            # 调整空间尺寸到 (10, 13)
-            nn.Conv2d(num_filters[2] * expansion, 512, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-        )
-        self.sap_pool3 = SelfAttentivePooling(512 * 10, 128)
-        self.middle3_bn1 = nn.BatchNorm1d(5120)
-        self.middle3_linear = nn.Linear(5120, embd_dim)
-        self.middle3_bn2 = nn.BatchNorm1d(embd_dim)
-        self.middle3_fc = nn.Linear(embd_dim, num_class)
-        # self.middle_fc3 = nn.Linear(512, num_class)
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
@@ -192,7 +140,7 @@ class ResNetSE(nn.Module):
             )
 
         layers = [block(self.inplanes, planes, stride, downsample)]
-        self.inplanes = planes * block.expansion # SEBottleneck的expansion = 2，plane=（32，64，128，256）
+        self.inplanes = planes * block.expansion
         for i in range(1, blocks):
             layers.append(block(self.inplanes, planes))
 
@@ -203,51 +151,19 @@ class ResNetSE(nn.Module):
         x = x.unsqueeze(1)  # (1,1,80,98)
         x = self.conv1(x) # (1,32,80,98)
         x = self.bn1(x) # (1,32,80,98)
-        x = self.relu(x) # (1,32,80,98)
-        # 主分支处理
-        x1 = self.layer1(x) # (1,64,80,98)
-        x1_att = self.attention1(x1) # 应用se注意力
-        middle1_out = self.bottleneck1_1(x1_att)  # 输出形状: (1, 512, 10, 13)
-        middle1_out = middle1_out.reshape(middle1_out.size(0), -1, middle1_out.size(-1))  # (1, 512 * 10, 13)
-        middle1_out = self.sap_pool1(middle1_out) # (1, 5120)
-        middle1_out = self.middle1_bn1(middle1_out)
-        middle1_fea = middle1_out  # (1, 5120)
-        middle1_out = self.middle1_linear(middle1_out)
-        middle1_out = self.middle1_bn2(middle1_out)
-        middle1_out = self.middle1_fc(middle1_out)
+        x = self.relu(x)
 
-        x2 = self.layer2(x1) # (1,128,40,49)
-        x2_att = self.attention2(x2)  # 应用se注意力
-        middle2_out = self.bottleneck2_1(x2_att) # (1, 512, 10, 13)
-        middle2_out = middle2_out.reshape(middle2_out.size(0), -1, middle2_out.size(-1))  # (1, 512 * 10, 13)
-        middle2_out = self.sap_pool2(middle2_out)# (1, 5120)
-        middle2_out = self.middle2_bn1(middle2_out)
-        middle2_fea = middle2_out # (1, 5120)
-        middle2_out = self.middle2_linear(middle2_out)
-        middle2_out = self.middle2_bn2(middle2_out)
-        middle2_out = self.middle2_fc(middle2_out)
+        x = self.layer1(x) # (1,64,80,98)
+        x = self.layer2(x) # (1,128,40,49)
+        x = self.layer3(x) # (1,256,20,25)
+        x = self.layer4(x) # (1,512,10,13)
 
-        x3 = self.layer3(x2) # (1,256,20,25)
-        x3_att = self.attention3(x3)  # 应用se注意力
-        middle3_out = self.bottleneck3_1(x3_att) # (1, 512, 10, 13)
-        middle3_out = middle3_out.reshape(middle3_out.size(0), -1, middle3_out.size(-1))  # (1, 512 * 10, 13)
-        middle3_out = self.sap_pool3(middle3_out) # (1, 5120)
-        middle3_out = self.middle3_bn1(middle3_out)
-        middle3_fea = middle3_out # (1, 5120)
-        middle3_out = self.middle3_linear(middle3_out)
-        middle3_out = self.middle3_bn2(middle3_out)
-        middle3_out = self.middle3_fc(middle3_out)
-
-        x4 = self.layer4(x3) # (1,512,10,13)
-
-        x = x4.reshape(x4.shape[0], -1, x4.shape[-1]) # (1,5120,13)
+        x = x.reshape(x.shape[0], -1, x.shape[-1]) # (1,5120,13)
 
         x = self.pooling(x) # (1,5120)
         # x = x.reshape(x.shape[0], -1)
         x = self.bn2(x)
-        finnal_fea = x  # finnal_fea尺寸为(1,5120)
         x = self.linear(x)
         x = self.bn3(x) # (1,192)
         out = self.fc(x)
-
-        return out,middle1_out,middle2_out,middle3_out,finnal_fea,middle1_fea,middle2_fea,middle3_fea
+        return out
