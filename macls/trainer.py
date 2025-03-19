@@ -138,29 +138,67 @@ class MAClsTrainer(object):
         dataset_args = self.configs.dataset_conf.get('dataset', {})
         dataset_args.max_duration = max_duration
         data_loader_args = self.configs.dataset_conf.get('dataLoader', {})
-        data_loader_args.drop_last = False
+        data_loader_args.drop_last = False   # 确保完整数据
+        # data_loader_args['shuffle'] = False  # 强制关闭随机排序
         for data_list in [self.configs.dataset_conf.train_list, self.configs.dataset_conf.test_list]:
             test_dataset = MAClsDataset(data_list_path=data_list,
                                         audio_featurizer=self.audio_featurizer,
                                         mode='extract_feature',
                                         **dataset_args)
+            all_data_paths = test_dataset.data_paths # 关键点：获取完整路径列表
             test_loader = DataLoader(dataset=test_dataset,
                                      collate_fn=collate_fn,
                                      shuffle=False,
                                      **data_loader_args)
+            # 在处理前验证路径数量匹配
+            total_samples = len(test_dataset)
+            if len(all_data_paths) != total_samples:
+                raise RuntimeError("数据路径列表与样本数量不匹配")
+
+            # 新的音频特征数据命名，和之前的名字一样确保唯一性，之前的命名方式以时间戳，可能会出现重复覆盖的错误，导致预处理后的数据量减少
+            current_idx = 0
             save_data_list = data_list.replace('.txt', '_features.txt')
             with open(save_data_list, 'w', encoding='utf-8') as f:
-                for features, labels, input_lens in tqdm(test_loader):
-                    for i in range(len(features)):
-                        feature, label, input_len = features[i], labels[i], input_lens[i]
-                        feature = feature.numpy()[:input_len]
-                        label = int(label)
-                        save_path = os.path.join(save_dir, str(label),
-                                                 f'{int(time.time() * 1000)}.npy').replace('\\', '/')
+                for batch in tqdm(test_loader):
+                    features, labels, input_lens = batch
+                    actual_batch_size = len(features)  # 动态获取实际批次大小
+
+                    # 获取对应原始路径段
+                    batch_paths = all_data_paths[current_idx: current_idx + actual_batch_size]
+                    current_idx += actual_batch_size
+
+                    # 处理每个样本
+                    for i in range(actual_batch_size):
+                        # 生成唯一文件名（基于原始路径）
+                        original_name = os.path.splitext(
+                            os.path.basename(batch_paths[i]))[0]
+                        save_path = os.path.join(
+                            save_dir,
+                            str(labels[i].item()),
+                            f"{original_name}.npy"
+                        ).replace('\\', '/')
+
+                        # 保存文件与记录路径
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                        np.save(save_path, feature)
-                        f.write(f'{save_path}\t{label}\n')
+                        np.save(save_path, features[i].numpy()[:input_lens[i]])
+                        f.write(f"{save_path}\t{labels[i].item()}\n")
             logger.info(f'{data_list}列表中的数据已提取特征完成，新列表为：{save_data_list}')
+            logger.info(f"当前批次尺寸: {actual_batch_size} | 累计处理: {current_idx}/{total_samples}")
+
+            ### 旧的加载数据特征
+            # save_data_list = data_list.replace('.txt', '_features.txt')
+            # with open(save_data_list, 'w', encoding='utf-8') as f:
+            #     for features, labels, input_lens in tqdm(test_loader):
+            #         for i in range(len(features)):
+            #             feature, label, input_len = features[i], labels[i], input_lens[i]
+            #             feature = feature.numpy()[:input_len]
+            #             label = int(label)
+            #             save_path = os.path.join(save_dir, str(label),
+            #                                      f'{int(time.time() * 1000)}.npy').replace('\\', '/')
+            #             os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            #             np.save(save_path, feature)
+            #             f.write(f'{save_path}\t{label}\n')
+            # logger.info(f'{data_list}列表中的数据已提取特征完成，新列表为：{save_data_list}')
 
     def __setup_model(self, input_size, is_train=False):
         """ 获取模型
@@ -352,7 +390,7 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_train_results_a0.8_b4e-2.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_train_results_a0.8_b4e-2_lr3e-4_6classes_augmentation.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
