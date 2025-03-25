@@ -1,6 +1,7 @@
 import os
 import platform
 import time
+from collections import defaultdict
 from datetime import timedelta
 
 import numpy as np
@@ -311,7 +312,7 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_Res2Net_train_results_lr1e-4_8classes_newfeatures87_num3200.csv')
+        result_csv = os.path.join(result_dir, 'test.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
@@ -394,7 +395,7 @@ class MAClsTrainer(object):
                                 amp_scaler=self.amp_scaler, save_model_path=save_model_path, epoch_id=epoch_id,
                                 accuracy=self.eval_acc)
 
-    def evaluate(self, resume_model=None, save_matrix_path=None):
+    def evaluate(self, resume_model=None, save_matrix_path=None, correct_data_path=None):
         """
         评估模型
         :param resume_model: 所使用的模型
@@ -412,6 +413,32 @@ class MAClsTrainer(object):
             model_state_dict = torch.load(resume_model)
             self.model.load_state_dict(model_state_dict)
             logger.info(f'成功加载模型：{resume_model}')
+
+        # # 关键步骤1：直接从原始测试列表文件加载所有路径和标签
+        # test_data_list = []
+        # with open(self.configs.dataset_conf.test_list, 'r', encoding='utf-8') as f:
+        #     for line in f:
+        #         path, label = line.strip().split('\t')
+        #         test_data_list.append((path, int(label)))
+        # all_paths = [item[0] for item in test_data_list]
+        # all_labels = [item[1] for item in test_data_list]
+
+        # 关键修改1：直接从数据集获取路径和标签（确保顺序一致）
+        test_dataset = self.test_loader.dataset
+        all_paths = test_dataset.data_paths
+        all_labels = test_dataset.labels
+        # if hasattr(test_dataset, 'data_list'):
+        #     # 假设数据集类中存储了原始数据列表 [(path, label), ...]
+        #     all_paths = test_dataset.data_paths
+        #     all_labels = test_dataset.labels
+        # else:
+        #     raise AttributeError("数据集类必须实现data_list属性以追踪原始顺序")
+
+        # 关键步骤2：验证数据加载顺序
+        assert len(all_paths) == len(self.test_loader.dataset), "测试集文件与加载数据长度不一致"
+        # 评估过程收集正确样本索引
+        correct_indices = []
+
         self.model.eval()
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             eval_model = self.model.module
@@ -420,7 +447,13 @@ class MAClsTrainer(object):
 
         accuracies, losses, preds, labels = [], [], [], []
         with torch.no_grad():
-            for batch_id, (features, label, input_lens) in enumerate(tqdm(self.test_loader)):
+            for batch_idx, (features, label, input_lens) in enumerate(tqdm(self.test_loader)):
+
+                # 计算当前batch对应的全局索引
+                batch_size = features.size(0)
+                start_idx = batch_idx * self.test_loader.batch_size
+                batch_indices = range(start_idx, start_idx + batch_size)
+
                 if self.stop_eval: break
                 features = features.to(self.device)
                 label = label.to(self.device).long()
@@ -437,8 +470,23 @@ class MAClsTrainer(object):
                 # 真实标签
                 labels.extend(label.tolist())
                 losses.append(los.data.cpu().numpy())
+
+                correct_mask = (pred == label)
+                # print("correct_mask:",correct_mask)
+                # 记录正确索引
+                batch_correct_indices = np.where(correct_mask)[0].tolist()
+                # 转换为数据集中的全局索引
+                global_indices = [batch_idx * self.test_loader.batch_size + i for i in batch_correct_indices]
+                correct_indices.extend(global_indices)
+
+                # correct_indices.extend([batch_indices[i] for i in np.where(correct_mask)[0]])
+                # # print("正确索引:",correct_indices)
+
         loss = float(sum(losses) / len(losses)) if len(losses) > 0 else -1
         acc = float(sum(accuracies) / len(accuracies)) if len(accuracies) > 0 else -1
+        print("所有的真实标签:",labels)
+        print("所有的预测标签:",preds)
+        print("按照文件的所有真实标签：",all_labels)
         # 保存混淆矩阵
         if save_matrix_path is not None:
             try:
@@ -447,6 +495,21 @@ class MAClsTrainer(object):
                                       class_labels=self.class_labels)
             except Exception as e:
                 logger.error(f'保存混淆矩阵失败：{e}')
+
+        # 保存分类正确数据的数据路径
+        if correct_data_path is not None:
+
+            # 保存新数据集
+            os.makedirs(correct_data_path, exist_ok=True)
+            correct_list_path = os.path.join(correct_data_path, 'correct_samples.txt')
+            with open(correct_list_path, 'w', encoding='utf-8') as f:
+                for idx in correct_indices:
+                    path = all_paths[idx]
+                    true_label = all_labels[idx]
+                    f.write(f"{path}\t{true_label}\n")
+
+            logger.info(f"保存正确样本共 {len(correct_indices)} 个，路径：{correct_list_path}")
+
         self.model.train()
         return loss, acc
 
