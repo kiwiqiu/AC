@@ -1,6 +1,7 @@
 import os
 import platform
 import time
+from collections import defaultdict
 from datetime import timedelta
 
 import numpy as np
@@ -25,7 +26,6 @@ from macls.utils.checkpoint import load_pretrained, load_checkpoint, save_checkp
 from macls.utils.utils import dict_to_object, plot_confusion_matrix, print_arguments
 
 # VERSION 1
-# VERSION 2
 class MAClsTrainer(object):
     def __init__(self, configs, use_gpu=True, data_augment_configs=None):
         """ macls集成工具类
@@ -56,13 +56,6 @@ class MAClsTrainer(object):
         self.test_dataset = None
         self.test_loader = None
         self.amp_scaler = None
-        # 添加蒸馏参数（应在配置文件中定义）
-        self.temperature = self.configs.train_conf.distillation.temperature
-        self.alpha = self.configs.train_conf.distillation.alpha
-        self.beta = self.configs.train_conf.distillation.beta
-        print("self.beta type",type(self.beta))
-        print("self.beta temperature",type(self.temperature))
-        print("self.alpha type",type(self.alpha))
         # 读取数据增强配置文件
         if isinstance(data_augment_configs, str):
             with open(data_augment_configs, 'r', encoding='utf-8') as f:
@@ -146,6 +139,8 @@ class MAClsTrainer(object):
                                         mode='extract_feature',
                                         **dataset_args)
             all_data_paths = test_dataset.data_paths # 关键点：获取完整路径列表
+
+
             test_loader = DataLoader(dataset=test_dataset,
                                      collate_fn=collate_fn,
                                      shuffle=False,
@@ -209,7 +204,7 @@ class MAClsTrainer(object):
         # 自动获取列表数量
         if self.configs.model_conf.model_args.get('num_class', None) is None:
             self.configs.model_conf.model_args.num_class = len(self.class_labels)
-        # 获取模型 build_model
+        # 获取模型
         self.model = build_model(input_size=input_size, configs=self.configs)
         # 打印模型信息，98是长度，这个取决于输入的音频长度
         # self.model = nn.DataParallel(self.model)
@@ -231,18 +226,6 @@ class MAClsTrainer(object):
             self.scheduler = build_lr_scheduler(optimizer=self.optimizer, step_per_epoch=len(self.train_loader),
                                                 configs=self.configs)
 
-    def kd_loss(self, student_output, teacher_output):
-        """知识蒸馏损失"""
-        soft_teacher = torch.softmax(teacher_output / self.temperature, dim=1)
-        log_student = torch.log_softmax(student_output / self.temperature, dim=1)
-        loss_kd = -torch.mean(torch.sum(soft_teacher * log_student, dim=1))
-        return loss_kd
-        # return -(soft_teacher * log_student).sum(dim=1).mean() * (self.temperature ** 2)
-
-    def feature_loss(self, student_feature, teacher_feature):
-        """特征对齐损失"""
-        return torch.mean(torch.square(student_feature - teacher_feature.detach()))
-
     def __train_epoch(self, epoch_id, local_rank, writer, nranks=0):
         """训练一个epoch
 
@@ -252,12 +235,6 @@ class MAClsTrainer(object):
         :param nranks: 所使用显卡的数量
         """
         train_times, accuracies, loss_sum = [], [], []
-        # 初始化各层指标容器
-        metrics = {
-            'final_acc': [],
-            'mid1_acc': [], 'mid2_acc': [], 'mid3_acc': [],
-            'kd_loss': [], 'feature_loss': []
-        }
         start = time.time()
         for batch_id, (features, label, input_len) in enumerate(self.train_loader):
             if self.stop_train: break
@@ -269,39 +246,17 @@ class MAClsTrainer(object):
                 label = label.to(self.device).long()
             # 执行模型计算，是否开启自动混合精度
             with torch.autocast('cuda', enabled=self.configs.train_conf.enable_amp):
-                # 获取所有中间输出和特征
-                output, middle1_out, middle2_out, middle3_out, \
-                    finnal_fea, middle1_fea, middle2_fea, middle3_fea = self.model(features)
+                output = self.model(features)
             # 计算损失值
-            # 计算所有分类损失
-            # los = self.loss(output, label)
-            final_loss = self.loss(output, label)
-            middle1_loss = self.loss(middle1_out, label)
-            middle2_loss = self.loss(middle2_out, label)
-            middle3_loss = self.loss(middle3_out, label)
-            cls_loss = final_loss + middle1_loss + middle2_loss + middle3_loss
-            # 计算蒸馏损失
-            loss1_kd = self.kd_loss(middle1_out, output)
-            loss2_kd = self.kd_loss(middle2_out, output)
-            loss3_kd = self.kd_loss(middle3_out, output)
-            loss_kd = loss1_kd + loss2_kd + loss3_kd
-            # 计算特征对齐损失
-            loss_fea1 = self.feature_loss(middle1_fea, finnal_fea)
-            loss_fea2 = self.feature_loss(middle2_fea, finnal_fea)
-            loss_fea3 = self.feature_loss(middle3_fea, finnal_fea)
-            loss_fea = loss_fea1 + loss_fea2 + loss_fea3
-            # 组合总损失
-            total_loss = cls_loss * (1 - self.alpha) + \
-                          loss_kd * self.alpha + \
-                          loss_fea * self.beta
-            # 是否开启自动混合精度,反向传播
+            los = self.loss(output, label)
+            # 是否开启自动混合精度
             if self.configs.train_conf.enable_amp:
                 # loss缩放，乘以系数loss_scaling
-                scaled = self.amp_scaler.scale(total_loss)
+                scaled = self.amp_scaler.scale(los)
                 scaled.backward()
             else:
-                total_loss.backward()
-            # 是否开启自动混合精度，优化步骤
+                los.backward()
+            # 是否开启自动混合精度
             if self.configs.train_conf.enable_amp:
                 self.amp_scaler.unscale_(self.optimizer)
                 self.amp_scaler.step(self.optimizer)
@@ -310,67 +265,34 @@ class MAClsTrainer(object):
                 self.optimizer.step()
             self.optimizer.zero_grad()
 
-            # 计算各个batch的准确率
-            batch_metrics = {
-                'final_acc': accuracy(output, label),
-                'mid1_acc': accuracy(middle1_out, label),
-                'mid2_acc': accuracy(middle2_out, label),
-                'mid3_acc': accuracy(middle3_out, label),
-                'kd_loss': loss_kd.item(),
-                'feature_loss': loss_fea.item()
-            }
-            # 整合所有batch的acc和loss
-            for k, v in batch_metrics.items():
-                metrics[k].append(v)
-            loss_sum.append(total_loss.item())
-
+            # 计算准确率
+            acc = accuracy(output, label)
+            accuracies.append(acc)
+            loss_sum.append(los.data.cpu().numpy())
             train_times.append((time.time() - start) * 1000)
             self.train_step += 1
 
-            # 多卡训练只使用一个进程打印，log_interval=10，每10个batch进行打印
+            # 多卡训练只使用一个进程打印
             if batch_id % self.configs.train_conf.log_interval == 0 and local_rank == 0:
                 batch_id = batch_id + 1
-                # 所有acc的平均值
-                avg_metrics = {k: np.mean(v[-self.configs.train_conf.log_interval:])
-                               for k, v in metrics.items()}
                 # 计算每秒训练数据量
                 train_speed = self.configs.dataset_conf.dataLoader.batch_size / (
                         sum(train_times) / len(train_times) / 1000)
                 # 计算剩余时间
                 self.train_eta_sec = (sum(train_times) / len(train_times)) * (self.max_step - self.train_step) / 1000
                 eta_str = str(timedelta(seconds=int(self.train_eta_sec)))
-
-                # 构造日志信息
                 self.train_loss = sum(loss_sum) / len(loss_sum)
-                self.train_acc = avg_metrics['final_acc']
-
+                self.train_acc = sum(accuracies) / len(accuracies)
                 logger.info(f'Train epoch: [{epoch_id}/{self.configs.train_conf.max_epoch}], '
                             f'batch: [{batch_id}/{len(self.train_loader)}], '
-                            f'loss: {self.train_loss:.5f}, '
-                            f'accuracy: {self.train_acc:.2%}, '
-                            f"mid acc:{avg_metrics['mid1_acc']:.2%}/{avg_metrics['mid2_acc']:.2%}/{avg_metrics['mid3_acc']:.2%}"
-                            f'KD loss: {avg_metrics["kd_loss"]:.3f}, '
-                            f'Fea loss: {avg_metrics["feature_loss"]:.3f}, '
+                            f'loss: {self.train_loss:.5f}, accuracy: {self.train_acc:.2%}, '
                             f'learning rate: {self.scheduler.get_last_lr()[0]:>.8f}, '
                             f'speed: {train_speed:.2f} data/sec, eta: {eta_str}')
-                # 记录到visualdl
                 writer.add_scalar('Train/Loss', self.train_loss, self.train_log_step)
                 writer.add_scalar('Train/Accuracy', self.train_acc, self.train_log_step)
-                writer.add_scalars('Train/Accuracy', {
-                    'final': avg_metrics['final_acc'],
-                    'mid1': avg_metrics['mid1_acc'],
-                    'mid2': avg_metrics['mid2_acc'],
-                    'mid3': avg_metrics['mid3_acc']
-                }, self.train_step)
+                # 记录学习率
                 writer.add_scalar('Train/lr', self.scheduler.get_last_lr()[0], self.train_log_step)
-                writer.add_scalars('Train/SelfDistill', {
-                    'kd_loss': avg_metrics['kd_loss'],
-                    'feature_loss': avg_metrics['feature_loss']
-                }, self.train_step)
-                # 清空所有列表
                 train_times, accuracies, loss_sum = [], [], []
-                for k in metrics:
-                    metrics[k].clear()
                 self.train_log_step += 1
             start = time.time()
             self.scheduler.step()
@@ -390,11 +312,12 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_train_results_a0.8_b4e-2_lr1e-4_8classes_newfeatures87_num3200.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_tdnn_train_results_lr1e-4_dataset3.1.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
-                f.write("epoch,loss,final_acc,mid1_acc,mid2_acc,mid3_acc\n")
+                f.write("epoch,loss,final_acc\n")
+
         # 获取有多少张显卡训练
         nranks = torch.cuda.device_count()
         local_rank = 0
@@ -441,36 +364,27 @@ class MAClsTrainer(object):
             start_epoch = time.time()
             # 训练一个epoch
             self.__train_epoch(epoch_id=epoch_id, local_rank=local_rank, writer=writer, nranks=nranks)
-            # 多卡训练只使用一个进程执行评估和保存模型，多卡训练时仅主进程验证：通过 local_rank == 0 避免重复计算。
+            # 多卡训练只使用一个进程执行评估和保存模型.，多卡训练时仅主进程验证：通过 local_rank == 0 避免重复计算。
             if local_rank == 0:
                 if self.stop_eval: continue
                 logger.info('=' * 70)
                 # 每个epoch结束后验证一次
-                self.eval_loss, self.eval_acc, mid1_acc, mid2_acc, mid3_acc = self.evaluate()
-                logger.info('Test epoch: {}, time/epoch: {}, loss: {:.5f}, final_accuracy: {:.2%}\n'
-                            'mid1_accuracy: {:.2%}, mid2_accuracy: {:.2%}, mid3_accuracy: {:.2%}'
-                            .format(
-                    epoch_id, str(timedelta(seconds=(time.time() - start_epoch))), self.eval_loss, self.eval_acc, mid1_acc, mid2_acc, mid3_acc))
+                self.eval_loss, self.eval_acc = self.evaluate()
+                logger.info('Test epoch: {}, time/epoch: {}, loss: {:.5f}, accuracy: {:.5f}'.format(
+                    epoch_id, str(timedelta(seconds=(time.time() - start_epoch))), self.eval_loss, self.eval_acc))
                 logger.info('=' * 70)
-
                 writer.add_scalar('Test/Accuracy', self.eval_acc, self.test_log_step)
                 writer.add_scalar('Test/Loss', self.eval_loss, self.test_log_step)
-                writer.add_scalars('Test/Mid_Accuracy', {'mid1': mid1_acc,'mid2': mid2_acc,'mid3': mid3_acc }, self.test_log_step)
-
                 # 保存到本地 CSV 文件
                 with open(result_csv, 'a', encoding='utf-8') as f:
                     f.write(
                         f"{epoch_id},"
                         f"{self.eval_loss:.5f},"
-                        f"{self.eval_acc:.5f},"
-                        f"{mid1_acc:.5f},"
-                        f"{mid2_acc:.5f},"
-                        f"{mid3_acc:.5f}\n"
-                    )
-
+                        f"{self.eval_acc:.5f}\n"
+                        )
                 self.test_log_step += 1
                 self.model.train()
-                # 保存最优模型
+                # # 保存最优模型
                 if self.eval_acc >= best_acc:
                     best_acc = self.eval_acc
                     save_checkpoint(configs=self.configs, model=self.model, optimizer=self.optimizer,
@@ -481,7 +395,7 @@ class MAClsTrainer(object):
                                 amp_scaler=self.amp_scaler, save_model_path=save_model_path, epoch_id=epoch_id,
                                 accuracy=self.eval_acc)
 
-    def evaluate(self, resume_model=None, save_matrix_path=None):
+    def evaluate(self, resume_model=None, save_matrix_path=None, correct_data_path=None):
         """
         评估模型
         :param resume_model: 所使用的模型
@@ -499,38 +413,56 @@ class MAClsTrainer(object):
             model_state_dict = torch.load(resume_model)
             self.model.load_state_dict(model_state_dict)
             logger.info(f'成功加载模型：{resume_model}')
+
+        # # 关键步骤1：直接从原始测试列表文件加载所有路径和标签
+        # test_data_list = []
+        # with open(self.configs.dataset_conf.test_list, 'r', encoding='utf-8') as f:
+        #     for line in f:
+        #         path, label = line.strip().split('\t')
+        #         test_data_list.append((path, int(label)))
+        # all_paths = [item[0] for item in test_data_list]
+        # all_labels = [item[1] for item in test_data_list]
+
+        # 关键修改1：直接从数据集获取路径和标签（确保顺序一致）
+        test_dataset = self.test_loader.dataset
+        all_paths = test_dataset.data_paths
+        all_labels = test_dataset.labels
+        # if hasattr(test_dataset, 'data_list'):
+        #     # 假设数据集类中存储了原始数据列表 [(path, label), ...]
+        #     all_paths = test_dataset.data_paths
+        #     all_labels = test_dataset.labels
+        # else:
+        #     raise AttributeError("数据集类必须实现data_list属性以追踪原始顺序")
+
+        # 关键步骤2：验证数据加载顺序
+        assert len(all_paths) == len(self.test_loader.dataset), "测试集文件与加载数据长度不一致"
+        # 评估过程收集正确样本索引
+        correct_indices = []
+
         self.model.eval()
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             eval_model = self.model.module
         else:
             eval_model = self.model
-            # 初始化指标容器（新增中间层）
-        metrics = {
-            'final_acc': [],
-            'mid1_acc': [],
-            'mid2_acc': [],
-            'mid3_acc': []
-        }
+
         accuracies, losses, preds, labels = [], [], [], []
         with torch.no_grad():
-            for batch_id, (features, label, input_lens) in enumerate(tqdm(self.test_loader)):
+            for batch_idx, (features, label, input_lens) in enumerate(tqdm(self.test_loader)):
+
+                # 计算当前batch对应的全局索引
+                batch_size = features.size(0)
+                start_idx = batch_idx * self.test_loader.batch_size
+                batch_indices = range(start_idx, start_idx + batch_size)
+
                 if self.stop_eval: break
                 features = features.to(self.device)
                 label = label.to(self.device).long()
-                output, middle1_out, middle2_out, middle3_out, \
-                    finnal_fea, middle1_fea, middle2_fea, middle3_fea = eval_model(features)
+                output = eval_model(features)
                 los = self.loss(output, label)
-                # 计算各层准确率
-                final_acc = accuracy(output, label)
-                mid1_acc = accuracy(middle1_out, label)
-                mid2_acc = accuracy(middle2_out, label)
-                mid3_acc = accuracy(middle3_out, label)
-                accuracies.append(final_acc)
-                metrics['final_acc'].append(final_acc)
-                metrics['mid1_acc'].append(mid1_acc)
-                metrics['mid2_acc'].append(mid2_acc)
-                metrics['mid3_acc'].append(mid3_acc)
-                # 模型预测标签,(仍基于最终输出)
+                # 计算准确率
+                acc = accuracy(output, label)
+                accuracies.append(acc)
+                # 模型预测标签
                 label = label.data.cpu().numpy()
                 output = output.data.cpu().numpy()
                 pred = np.argmax(output, axis=1)
@@ -538,11 +470,23 @@ class MAClsTrainer(object):
                 # 真实标签
                 labels.extend(label.tolist())
                 losses.append(los.data.cpu().numpy())
-        # 计算平均指标
-        avg_metrics = {k: np.mean(v) for k, v in metrics.items()}
+
+                correct_mask = (pred == label)
+                # print("correct_mask:",correct_mask)
+                # 记录正确索引
+                batch_correct_indices = np.where(correct_mask)[0].tolist()
+                # 转换为数据集中的全局索引
+                global_indices = [batch_idx * self.test_loader.batch_size + i for i in batch_correct_indices]
+                correct_indices.extend(global_indices)
+
+                # correct_indices.extend([batch_indices[i] for i in np.where(correct_mask)[0]])
+                # # print("正确索引:",correct_indices)
+
         loss = float(sum(losses) / len(losses)) if len(losses) > 0 else -1
         acc = float(sum(accuracies) / len(accuracies)) if len(accuracies) > 0 else -1
-        # acc = {k: np.mean(v) for k, v in metrics.items()}
+        # print("所有的真实标签:",labels)
+        # print("所有的预测标签:",preds)
+        # print("按照文件的所有真实标签：",all_labels)
         # 保存混淆矩阵
         if save_matrix_path is not None:
             try:
@@ -551,16 +495,23 @@ class MAClsTrainer(object):
                                       class_labels=self.class_labels)
             except Exception as e:
                 logger.error(f'保存混淆矩阵失败：{e}')
+
+        # 保存分类正确数据的数据路径
+        if correct_data_path is not None:
+
+            # 保存新数据集
+            os.makedirs(correct_data_path, exist_ok=True)
+            correct_list_path = os.path.join(correct_data_path, 'correct_samples.txt')
+            with open(correct_list_path, 'w', encoding='utf-8') as f:
+                for idx in correct_indices:
+                    path = all_paths[idx]
+                    true_label = all_labels[idx]
+                    f.write(f"{path}\t{true_label}\n")
+
+            logger.info(f"保存正确样本共 {len(correct_indices)} 个，路径：{correct_list_path}")
+
         self.model.train()
-        logger.info(f'Evaluate | Loss: {loss:.5f}, '
-                    f'Final Acc: {avg_metrics["final_acc"]:.2%}, '
-                    f'Mid1 Acc: {avg_metrics["mid1_acc"]:.2%}, '
-                    f'Mid2 Acc: {avg_metrics["mid2_acc"]:.2%}, '
-                    f'Mid3 Acc: {avg_metrics["mid3_acc"]:.2%}, ')
-
-        return loss, acc, avg_metrics['mid1_acc'], avg_metrics['mid2_acc'], avg_metrics['mid3_acc']
-
-
+        return loss, acc
 
     def export(self, save_model_path='models/', resume_model='models/EcapaTdnn_Fbank/best_model/'):
         """
