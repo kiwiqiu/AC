@@ -3,7 +3,7 @@ import platform
 import time
 from collections import defaultdict
 from datetime import timedelta
-
+from unbalanced_loss.focal_loss import MultiFocalLoss
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -215,8 +215,14 @@ class MAClsTrainer(object):
             self.model = torch.compile(self.model, mode="reduce-overhead")
         # print(self.model)
         # 获取损失函数
+        # 原始交叉熵CE
         label_smoothing = self.configs.train_conf.get('label_smoothing', 0.0)
-        self.loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        # self.loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+        # focal loss， V2:alpha=[1,1,1,2,2,2,1,3]
+        self.loss = MultiFocalLoss(num_class=self.configs.model_conf.model_args.num_class, gamma=2, reduction='mean')
+
+        # dice loss
         if is_train:
             if self.configs.train_conf.enable_amp:
                 self.amp_scaler = torch.GradScaler(init_scale=1024)
@@ -244,10 +250,13 @@ class MAClsTrainer(object):
             else:
                 features = features.to(self.device)
                 label = label.to(self.device).long()
+                # print(type(label))
             # 执行模型计算，是否开启自动混合精度
             with torch.autocast('cuda', enabled=self.configs.train_conf.enable_amp):
                 output = self.model(features)
-            # 计算损失值
+                # print(type(output))
+                # print(output)
+                # 计算损失值
             los = self.loss(output, label)
             # 是否开启自动混合精度
             if self.configs.train_conf.enable_amp:
@@ -312,7 +321,7 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_tdnn_train_results_lr1e-4_dataset3.1.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_Res2Net_train_results_FocalLossV1_lr1e-4_dataset3.1.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
