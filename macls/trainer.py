@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchinfo import summary
@@ -226,10 +226,11 @@ class MAClsTrainer(object):
         # self.loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
         # focal loss， V1:alpha=1,V2:alpha=[1,1,1,2,2,2,1,3],V3:alpha=[1,1,1,1,1,3,1,4],V4:alpha=[2,1,1,1,1,4,1,5]
-        # self.loss = MultiFocalLoss(num_class=self.configs.model_conf.model_args.num_class,alpha=[2,1,1,1,1,4,1,5], gamma=2, reduction='mean')
+        self.loss = MultiFocalLoss(num_class=self.configs.model_conf.model_args.num_class, gamma=2, reduction='mean')
 
         # dice loss
-        self.loss = DiceLoss(reduction='mean')
+        # self.loss = DiceLoss(reduction='mean')
+
         if is_train:
             if self.configs.train_conf.enable_amp:
                 self.amp_scaler = torch.GradScaler(init_scale=1024)
@@ -302,6 +303,8 @@ class MAClsTrainer(object):
             total_loss = cls_loss * (1 - self.alpha) + \
                           loss_kd * self.alpha + \
                           loss_fea * self.beta
+            # total_loss = cls_loss * (1 - self.alpha) + \
+            #               loss_kd * self.alpha
             # 是否开启自动混合精度,反向传播
             if self.configs.train_conf.enable_amp:
                 # loss缩放，乘以系数loss_scaling
@@ -398,7 +401,7 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_SD_DiceLoss_epoch120_lr1e-4_dataset3.1.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_SD_FocalLoss_epoch60_lr1e-4_dataset3.2.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
@@ -454,7 +457,7 @@ class MAClsTrainer(object):
                 if self.stop_eval: continue
                 logger.info('=' * 70)
                 # 每个epoch结束后验证一次
-                self.eval_loss, self.eval_acc, mid1_acc, mid2_acc, mid3_acc = self.evaluate()
+                self.eval_loss, self.eval_acc, precision, recall, f1, mid1_acc, mid2_acc, mid3_acc = self.evaluate()
                 logger.info('Test epoch: {}, time/epoch: {}, loss: {:.5f}, final_accuracy: {:.2%}\n'
                             'mid1_accuracy: {:.2%}, mid2_accuracy: {:.2%}, mid3_accuracy: {:.2%}'
                             .format(
@@ -555,9 +558,16 @@ class MAClsTrainer(object):
         # print("所有的预测标签:", preds)
         # print("按照文件的所有真实标签：", all_labels)
         # 保存混淆矩阵
+
+        # precision
+        precision = precision_score(labels, preds, average='weighted')
+        recall = recall_score(labels, preds, average='weighted')
+        f1 = f1_score(labels, preds, average='weighted')
+        print("precision,recall,f1-score",precision,recall,f1)
         if save_matrix_path is not None:
             try:
                 cm = confusion_matrix(labels, preds)
+                print("Confusion matrix:",cm)
                 plot_confusion_matrix(cm=cm, save_path=os.path.join(save_matrix_path, f'{int(time.time())}.png'),
                                       class_labels=self.class_labels)
             except Exception as e:
@@ -569,8 +579,7 @@ class MAClsTrainer(object):
                     f'Mid2 Acc: {avg_metrics["mid2_acc"]:.2%}, '
                     f'Mid3 Acc: {avg_metrics["mid3_acc"]:.2%}, ')
 
-        return loss, acc, avg_metrics['mid1_acc'], avg_metrics['mid2_acc'], avg_metrics['mid3_acc']
-
+        return loss, acc, precision, recall, f1, avg_metrics['mid1_acc'], avg_metrics['mid2_acc'], avg_metrics['mid3_acc']
 
 
     def export(self, save_model_path='models/', resume_model='models/EcapaTdnn_Fbank/best_model/'):
