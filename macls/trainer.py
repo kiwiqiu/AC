@@ -225,11 +225,15 @@ class MAClsTrainer(object):
         label_smoothing = self.configs.train_conf.get('label_smoothing', 0.0)
         # self.loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-        # focal loss， V1:alpha=1,V2:alpha=[1,1,1,2,2,2,1,3],V3:alpha=[1,1,1,1,1,3,1,4],V4:alpha=[2,1,1,1,1,4,1,5]
+        # focal loss， V1:alpha=1,V2:alpha=[1,1,1,2,2,2,1,3],V3:alpha=[1,1,1,1,1,3,1,4],V4:alpha=[2,1,1,1,1,4,1,5],V5:alpha=[1,1,1,1,1,2,1]
         self.loss = MultiFocalLoss(num_class=self.configs.model_conf.model_args.num_class, gamma=2, reduction='mean')
 
         # dice loss
         # self.loss = DiceLoss(reduction='mean')
+
+        # 分层损失策略：仅深层使用Focal Loss，中间层用标准CE
+        self.focal_loss = MultiFocalLoss(num_class=self.configs.model_conf.model_args.num_class, gamma=2, reduction='mean')
+        self.ce_loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
         if is_train:
             if self.configs.train_conf.enable_amp:
@@ -251,6 +255,10 @@ class MAClsTrainer(object):
     def feature_loss(self, student_feature, teacher_feature):
         """特征对齐损失"""
         return torch.mean(torch.square(student_feature - teacher_feature.detach()))
+
+    # 课程学习策略：初期侧重分类，后期逐步增加蒸馏
+    def get_current_weight(self, epoch, max_epoch, base_weight):
+        return base_weight * (epoch / max_epoch) ** 2  # 二次曲线增长
 
     def __train_epoch(self, epoch_id, local_rank, writer, nranks=0):
         """训练一个epoch
@@ -284,10 +292,11 @@ class MAClsTrainer(object):
             # 计算损失值
             # 计算所有分类损失
             # los = self.loss(output, label)
-            final_loss = self.loss(output, label)
-            middle1_loss = self.loss(middle1_out, label)
-            middle2_loss = self.loss(middle2_out, label)
-            middle3_loss = self.loss(middle3_out, label)
+            final_loss = self.focal_loss(output, label)
+            middle1_loss = self.ce_loss(middle1_out, label)
+            middle2_loss = self.ce_loss(middle2_out, label)
+            middle3_loss = self.ce_loss(middle3_out, label)
+            # cls_loss = final_loss + 0.3 * middle1_loss + 0.3 * middle2_loss + 0.3 * middle3_loss
             cls_loss = final_loss + middle1_loss + middle2_loss + middle3_loss
             # 计算蒸馏损失
             loss1_kd = self.kd_loss(middle1_out, output)
@@ -299,12 +308,22 @@ class MAClsTrainer(object):
             loss_fea2 = self.feature_loss(middle2_fea, finnal_fea)
             loss_fea3 = self.feature_loss(middle3_fea, finnal_fea)
             loss_fea = loss_fea1 + loss_fea2 + loss_fea3
-            # 组合总损失
+            # 组合总损失v1
             total_loss = cls_loss * (1 - self.alpha) + \
                           loss_kd * self.alpha + \
                           loss_fea * self.beta
-            # total_loss = cls_loss * (1 - self.alpha) + \
-            #               loss_kd * self.alpha
+            # 组合总损失v2 线性衰减分类损失权重
+            # max_epoch = self.configs.train_conf.max_epoch
+            # initial_alpha = self.alpha
+            # current_alpha = initial_alpha * (1 - epoch_id / max_epoch)
+            # total_loss = cls_loss * (1 - current_alpha) + loss_kd * current_alpha + loss_fea * self.beta
+            # 组合总损失v3
+            # max_epoch= self.configs.train_conf.max_epoch
+            # initial_alpha = self.alpha
+            # initial_beta = self.beta
+            # current_alpha = self.get_current_weight(epoch_id, max_epoch, initial_alpha)
+            # current_beta = self.get_current_weight(epoch_id, max_epoch, initial_beta)
+            # total_loss = cls_loss * (1-current_alpha) + current_alpha * loss_kd + current_beta * loss_fea
             # 是否开启自动混合精度,反向传播
             if self.configs.train_conf.enable_amp:
                 # loss缩放，乘以系数loss_scaling
@@ -401,7 +420,7 @@ class MAClsTrainer(object):
         # 创建结果保存路径
         result_dir = os.path.join(log_dir, "elevator_results")
         os.makedirs(result_dir, exist_ok=True)
-        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_SD_FocalLoss_epoch60_lr1e-4_dataset3.2.csv')
+        result_csv = os.path.join(result_dir, 'Elevator_ResNetSE_SD_totalLossV2.1_epoch60_lr3e-4_alpha0.8_dataset3.3.csv')
         # 初始化 CSV 表头（如果文件不存在）
         if not os.path.exists(result_csv):
             with open(result_csv, 'w', encoding='utf-8') as f:
